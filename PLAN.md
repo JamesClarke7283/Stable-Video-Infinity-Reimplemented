@@ -50,17 +50,25 @@ The 14B Pro trick (`y = [anchor_latent, motion_latent, zeros]` in extra input ch
 **cannot** be ported directly: the 5B DiT has no conditioning channels (in_dim 48 = z_dim).
 
 **Chosen approach — "SVI-Pro fused conditioning"**: generalize the 5B's native
-single-frame hold to an **N-frame clean hold**:
+single-frame hold to an **N-frame clean hold** (N ∈ {0,1,2}), covering both the
+model's native tasks — **I2V and T2V** (Wan2.2-TI2V-5B is a joint TI2V model):
 
-- `cond_latents = concat([anchor_latent, motion_latent], dim=1)` (1 or 2 latent frames).
+- `cond_latents = concat([anchor_latent?, motion_latent?], dim=1)` — 0, 1 or 2 latent frames.
 - Before denoising and **after every sampling step**: `latents[:, :, 0:num_cond] = cond_latents`
   (generalizes the existing `first_frame_latents` clamp in `wan_video.py:307-308`).
 - **Per-frame timestep map**: frames `0..num_cond-1` → t=0, frames `num_cond..T-1` → t
   (generalizes the `seperated_timestep` block in `model_fn_wan_video`, `wan_video.py:1215-1219`,
   which currently hard-codes exactly one t=0 frame).
-- First clip: `cond = [anchor]` (num_cond=1 — exactly native TI2V I2V behavior).
-  Later clips: `cond = [anchor, motion]` (num_cond=2, motion = `prev_last_latent[:, -num_motion_latent:]`,
-  default `num_motion_latent=1`).
+- Conditioning modes:
+  - **I2V first clip**: `cond = [anchor]` (num_cond=1 — exactly native TI2V I2V behavior).
+  - **I2V later clips**: `cond = [anchor, motion]` (num_cond=2).
+  - **T2V first clip**: `cond = []` (num_cond=0 — exactly native T2V).
+  - **T2V later clips**: `cond = [motion]` (num_cond=1); optionally
+    `cond = [anchor_generated, motion]` (num_cond=2) where `anchor_generated` is the first
+    latent of clip 1 — a *generated* anchor giving T2V chains the same cross-clip identity
+    anchor I2V gets from the user image. Inference flag `--t2v_anchor_mode {none, generated}`,
+    default `generated`. Training covers both by mixing anchor-free and anchored samples.
+  - motion = `prev_last_latent[:, -num_motion_latent:]`, default `num_motion_latent=1`.
 - The 14B "zero padding" slots need no port: they were filler inside a fixed-length `y`;
   in the fused scheme the remaining frames are simply the denoised ones.
 - Stitching: clip 0 keeps all 121 pixel frames; later clips drop the first
@@ -81,7 +89,7 @@ DiffSynth 2.0 framework. Flow-matching convention here:
 `x_t = (1-σ)x0 + σε`, velocity `v = ε − x0`, σ: 1→0, scheduler `FlowMatchScheduler("Wan")`,
 shift=5 (`diffsynth/diffusion/flow_match.py:30-39`).
 
-### 4.1 Training-sample construction (simulates clip k>1 inference)
+### 4.1 Training-sample construction (simulates both tasks and both clip positions)
 
 Per sample, dataset returns a **previous-clip block (121 frames)** and a **window block
 (121 frames)** taken consecutively from one video (`[s-121..s-1]` and `[s..s+120]`), plus an
@@ -89,16 +97,27 @@ Per sample, dataset returns a **previous-clip block (121 frames)** and a **windo
 `p_anchor_random≈0.5`, a random frame from the previous-clip region — mirrors SVI 1.0-Shot's
 `random_ref_frame` and SVI 2.0's "strong first-frame augmentation", README:185).
 
+**Task sampling** — the same dataset serves both tasks (one code path, `num_cond ∈ {0,1,2}`):
+
+| Mode | Prob. | cond_latents | Simulates |
+|---|---|---|---|
+| I2V chained | ~0.45 | [anchor, motion] (2) | I2V clip k>1 |
+| I2V first clip | ~0.15 | [anchor] (1) | I2V clip 1 / native I2V |
+| T2V chained | ~0.30 | [motion] (1) | T2V clip k>1 |
+| T2V pure | ~0.10 | [] (0) | T2V clip 1 / native T2V |
+
+(knob `--svi_mode_probs`; also teaches the generated-anchor case because the anchor is
+VAE-encoded the same way whether it came from a user image or clip 1 of a generated chain.)
+
 Two separate VAE encodes (both blocks are valid 4k+1 counts; a single 242-frame encode
 is not, and latent-boundary alignment must be exact):
 
 - `window_latents` = VAE(window) → 31 latents — the "clean" x0.
 - `prev_latents` = VAE(prev block) → 31 latents; `motion_latent = prev_latents[:, :, -1:]`.
-- `anchor_latent` = VAE(anchor frame) → 1 latent.
+- `anchor_latent` = VAE(anchor frame) → 1 latent (skipped for T2V-mode samples).
 
-If the random window starts too early for a previous block, fall back to **first-clip mode**
-(num_cond=1, no motion) — also teaches clip-1 behavior. Optionally mix in a small fraction
-of first-clip samples deliberately.
+If the random window starts too early for a previous block, fall back to the matching
+**first-clip mode** (no motion) — also teaches clip-1 behavior.
 
 ### 4.2 Error injection (paper Eq. 3; SVI 1.0 `train_svi.py:1090-1135`)
 
@@ -107,7 +126,7 @@ Per step, independent Bernoulli draws then a clean override:
 | Term | Prob. (default) | Sampled from | Injected into |
 |---|---|---|---|
 | E_vid (latent err) | 0.9 | `bank_vid`, current timestep grid | generated window latents (frames ≥ num_cond) |
-| E_img (cond err) | 0.9 | `bank_vid`, **all grids** (Unif_T), slice 2 consecutive latent frames | `cond_latents` (anchor+motion) |
+| E_img (cond err) | 0.9 | `bank_vid`, **all grids** (Unif_T), slice `num_cond` consecutive latent frames | `cond_latents` (whichever of anchor/motion are present) |
 | E_noi (noise err) | 0.01 | `bank_noi`, current grid | noise ε |
 | clean override | 0.5 | — | disables all three (preserve generation ability) |
 
@@ -208,6 +227,9 @@ state-dict hash — use the untouched official 5B files; H/W must be divisible b
   `seed = clip_idx * 42`, fixed negative prompt (same long Chinese negative prompt as the
   14B scripts). Load SVI LoRA via `pipe.load_lora(pipe.dit, lora_path, alpha=1)`
   (alpha is test-time error-recycling intensity, paper Table 7: keep 1.0; degrade ≤0.8 hurts).
+- **Both tasks supported**: `--task i2v` (anchor = `--image`) and `--task t2v`
+  (`--t2v_anchor_mode {none, generated}`, default `generated` — clip 1's first latent
+  becomes the shared anchor for clips ≥2).
 - Single DiT → no `switch_DiT_boundary`, no high/low expert LoRA pair; one LoRA covers the
   full timestep range.
 - Optional later: lightx2v-style step-distillation LoRA on top (ComfyUI-only for A14B today;
@@ -299,7 +321,8 @@ state-dict hash — use the untouched official 5B files; H/W must be divisible b
 
 - `inference_svi_pro_5b.py` (CLI mirror of the repo's 14B `inference_svi_2.0_pro.py`)
   generates arbitrarily long chained videos with the trained `svi_pro_5b_lora.safetensors`
-  (rank 128) on Wan2.2-TI2V-5B at **720P, 121 frames/clip, 24fps**, with
+  (rank 128) on Wan2.2-TI2V-5B at **720P, 121 frames/clip, 24fps**, **for both tasks** —
+  `--task i2v` (user-image anchor) and `--task t2v` (generated or no anchor) — with
   anchor-consistent identity and no visible drift accumulation over ≥10 clips,
   quantitatively beating base 5B chaining on the eval suite.
 - All code committed regularly; PLAN.md updated as reality diverges from plan.
