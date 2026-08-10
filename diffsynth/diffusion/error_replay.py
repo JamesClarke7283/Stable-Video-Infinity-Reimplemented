@@ -53,7 +53,7 @@ class ErrorReplayBank:
     def _pool(self, error: torch.Tensor):
         orig_hw = error.shape[-2:]
         if self.spatial_pool > 1:
-            error = F.avg_pool2d(error.float(), kernel_size=self.spatial_pool)
+            error = F.avg_pool3d(error.float(), kernel_size=(1, self.spatial_pool, self.spatial_pool))
         return error.to(self.store_dtype), orig_hw
 
     def update(self, bank: str, timestep, error: torch.Tensor):
@@ -72,7 +72,7 @@ class ErrorReplayBank:
     def _unpool(self, entry: torch.Tensor, orig_hw):
         out = entry.float()
         if self.spatial_pool > 1 and tuple(out.shape[-2:]) != tuple(orig_hw):
-            out = F.interpolate(out, size=orig_hw, mode="bilinear", align_corners=False)
+            out = F.interpolate(out, size=(out.shape[2], *orig_hw), mode="trilinear", align_corners=False)
         return out
 
     def _sample_entry(self, bank: str, grid: int):
