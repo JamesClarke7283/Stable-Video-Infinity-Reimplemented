@@ -154,6 +154,8 @@ class WanSVITrainingModule(DiffusionTrainingModule):
             "width": video[0].size[0],
             "num_frames": len(video),
             "cfg_scale": 1,
+            "cfg_merge": False,
+            "vace_scale": 1,
             "tiled": self.vae_tiled,
             "tile_size": (30, 52),
             "tile_stride": (15, 26),
