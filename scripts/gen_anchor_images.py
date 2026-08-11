@@ -26,10 +26,10 @@ def main():
     parser.add_argument("--model_id", default="lodestones/Chroma1-HD")
     args = parser.parse_args()
 
-    from diffusers import FluxPipeline
+    from diffusers import ChromaPipeline
 
     os.makedirs(args.out_dir, exist_ok=True)
-    pipe = FluxPipeline.from_pretrained(args.model_id, torch_dtype=torch.bfloat16)
+    pipe = ChromaPipeline.from_pretrained(args.model_id, torch_dtype=torch.bfloat16)
     pipe.to("cuda")
 
     prompts = PROMPTS[: args.num_images] if args.num_images else PROMPTS
