@@ -35,4 +35,5 @@ export DIFFSYNTH_DOWNLOAD_SOURCE=huggingface
   --svi_max_errors_per_grid 200 \
   --svi_spatial_pool 2 \
   --svi_mode_probs "0.45,0.15,0.30,0.10" \
-  --svi_loss_mask_cond_frames 1
+  --svi_loss_mask_cond_frames 1 \
+  --resume_auto

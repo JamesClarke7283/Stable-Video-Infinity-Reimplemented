@@ -19,10 +19,45 @@ from diffsynth.diffusion.training_module import DiffusionTrainingModule
 from diffsynth.diffusion.error_replay import ErrorReplayBank
 from diffsynth.diffusion.loss import SVIConfig, SVIErrorRecyclingLoss
 from diffsynth.diffusion.logger import ModelLogger
-from diffsynth.diffusion.runner import launch_training_task
 from diffsynth.diffusion.parsers import add_general_config, add_video_size_config
+from tqdm import tqdm
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def launch_svi_training_task(accelerator, dataset, model, model_logger, args):
+    """Training loop with a global tqdm bar (loss + EMA + error-bank occupancy)
+    and grad clipping 1.0 (paper Table 9). Forked from
+    diffsynth.diffusion.runner.launch_training_task."""
+    optimizer = torch.optim.AdamW(model.trainable_modules(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
+    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=args.dataset_num_workers)
+    model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    raw_model = model.module if hasattr(model, "module") else model
+
+    total_steps = len(dataloader) * args.num_epochs
+    ema = None
+    with tqdm(total=total_steps, desc="svi-train", dynamic_ncols=True) as pbar:
+        for epoch_id in range(args.num_epochs):
+            for data in dataloader:
+                with accelerator.accumulate(model):
+                    optimizer.zero_grad()
+                    loss = model(data)
+                    accelerator.backward(loss)
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    model_logger.on_step_end(accelerator, model, args.save_steps)
+                    scheduler.step()
+                v = loss.detach().float().item()
+                ema = v if ema is None else 0.98 * ema + 0.02 * v
+                occ = raw_model.error_bank.occupancy()
+                pbar.set_postfix(loss=f"{v:.4f}", ema=f"{ema:.4f}",
+                                 bank_vid=occ["vid"]["total"], bank_noi=occ["noi"]["total"],
+                                 epoch=epoch_id)
+                pbar.update(1)
+            if args.save_steps is None:
+                model_logger.on_epoch_end(accelerator, model, epoch_id)
+    model_logger.on_training_end(accelerator, model, args.save_steps)
 
 
 class LoadSVIVideoPair(DataProcessingOperator):
@@ -198,12 +233,32 @@ def svi_parser():
     parser.add_argument("--svi_mode_probs", type=str, default="0.45,0.15,0.30,0.10",
                         help="Comma probs for i2v_chained,i2v_first,t2v_chained,t2v_pure.")
     parser.add_argument("--svi_loss_mask_cond_frames", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--resume_auto", action="store_true",
+                        help="Auto-resume from the newest checkpoint in --output_path (weights only).")
     return parser
+
+
+def find_latest_checkpoint(output_path):
+    """Newest step-*.safetensors / epoch-*.safetensors in output_path, by mtime."""
+    import glob
+    cks = glob.glob(os.path.join(output_path, "step-*.safetensors")) + \
+          glob.glob(os.path.join(output_path, "epoch-*.safetensors"))
+    if not cks:
+        return None
+    return max(cks, key=os.path.getmtime)
 
 
 if __name__ == "__main__":
     parser = svi_parser()
     args = parser.parse_args()
+    if args.resume_auto and args.lora_checkpoint is None:
+        latest = find_latest_checkpoint(args.output_path)
+        if latest is not None:
+            args.lora_checkpoint = latest
+            print(f"[svi] AUTO-RESUME: loading LoRA weights from {latest}", flush=True)
+            print("[svi] note: optimizer state and error banks reset; banks refill during warmup iters.", flush=True)
+        else:
+            print(f"[svi] AUTO-RESUME: no checkpoint in {args.output_path}, starting fresh.", flush=True)
     accelerator = accelerate.Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
@@ -258,4 +313,4 @@ if __name__ == "__main__":
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
     )
-    launch_training_task(accelerator, dataset, model, model_logger, args=args)
+    launch_svi_training_task(accelerator, dataset, model, model_logger, args)
