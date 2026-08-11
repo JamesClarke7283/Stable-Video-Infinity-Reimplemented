@@ -326,3 +326,33 @@ state-dict hash — use the untouched official 5B files; H/W must be divisible b
   anchor-consistent identity and no visible drift accumulation over ≥10 clips,
   quantitatively beating base 5B chaining on the eval suite.
 - All code committed regularly; PLAN.md updated as reality diverges from plan.
+
+## 11. Implementation log (running)
+
+- **8.0 done (2026-08-10)**: svi_wan22 imported as baseline (commit c748715); uv venv
+  py3.12 + torch 2.11.0+cu128 (Blackwell sm_120 OK); Wan2.2-TI2V-5B DiT/T5/VAE
+  pre-downloaded into `./models/`; stock gate passed — T2V+I2V at 720P/121f/24fps.
+  **Deviation**: `redirect_common_files=True` points at a dead HF repo — all our
+  entry points pass `redirect_common_files=False` and use the original `.pth` files.
+- **8.2/8.3 done (2026-08-10)**: pipeline + ERFT implemented as planned
+  (`wan_video_svi_pro_5b.py`, `error_replay.py`, `SVIErrorRecyclingLoss`,
+  `train_svi.py`, `inference_svi_pro_5b.py`). Unit tests 18/18; GPU smoke 6/6 —
+  SVI first clip is **bit-identical** to stock I2V; clamp checks pass for I2V
+  chained, T2V chained, and generated-anchor modes.
+- **8.3b done (2026-08-10)**: 60-step smoke training on 10-clip toy set (480×832×121,
+  single-stage): loss finite (0.154 @ iter 20), banks filling, 600-tensor bf16 LoRA
+  ckpt round-trips through `pipe.load_lora` (300 modules fused), generation sane.
+  ~4.3s/step at 480p single-stage.
+- **8.4 dataset decision (2026-08-11)**: FastVideo's `mixkit_filtered_6k_wan1.3_t2v`
+  holds Wan2.1 latents (unusable); `FastVideo/Mixkit-Src` clips are all exactly 6s
+  (too short for chained samples). Using **LanguageBind/Open-Sora-Plan-v1.0.0
+  `mixkit.tar.gz` (27GB, the original MixKit pool that SVI 1.0's 6K came from)**,
+  streamed via `scripts/prepare_dataset.py`: keep ≥5.1s, normalize to 24fps,
+  captions from `llava_path_cap_64x512x512.json` (434K LLaVA captions) with
+  de-slug fallback. Target ~1500 kept videos (disk-constrained).
+- **Error-bank adaptation (2026-08-10)**: at 720P a full-size bank (50 grids × Z=500
+  × 10.5MB) needs ~260GB RAM. Errors are spatially avg-pooled ×2 before banking and
+  bilinear-upsampled on injection; Z=200 → ~26GB. Knobs: `--svi_spatial_pool`,
+  `--svi_max_errors_per_grid`.
+- **8.1 merged into 8.3b**: stock-framework LoRA sanity is covered by the SVI smoke
+  run (same accelerate/runner/ModelLogger path), so no separate stock run.
