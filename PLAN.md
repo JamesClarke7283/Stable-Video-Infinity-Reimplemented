@@ -291,10 +291,18 @@ state-dict hash — use the untouched official 5B files; H/W must be divisible b
   base 5B vs 5B+SVI-LoRA, VBench++ subset (subject/background consistency, imaging/aesthetic
   quality, dynamic degree, motion smoothness) on a small fixed suite; watch for the
   metric-fooling failure modes (paper Table 5: near-zero dynamic degree = bad).
+  I2V anchors are generated with lodestones/Chroma1-HD (35 steps, CFG 4.0); error/drift
+  analysis via ffmpeg frame splitting + per-frame metrics (`scripts/analyze_video.py`).
 - Ablations if time: p_img off (expect the big drop, paper Tab. 4), LoRA alpha at test,
   lr 2e-5 vs 1e-4, num_motion_latent 1 vs 2.
 - Known risk from paper (B.4): color shift when test style diverges from training
   distribution → mitigate via data diversity if observed.
+
+### 8.7 Publish the checkpoint
+- Push the validated LoRA safetensors to **HuggingFace `Impulse2000/svi-model-pro-5b`**
+  (auth as Impulse2000 already present): create the model repo if needed, upload
+  `svi_pro_5b_lora.safetensors` + a model card (base model, training config, usage with
+  `inference_svi_pro_5b.py`, eval results, license note per upstream Apache-2.0).
 
 ## 9. Risks / open questions
 
