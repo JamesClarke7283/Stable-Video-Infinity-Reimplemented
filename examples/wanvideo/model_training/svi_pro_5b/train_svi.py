@@ -173,8 +173,8 @@ class WanSVITrainingModule(DiffusionTrainingModule):
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
         loss = self.task_to_loss[self.task](self.pipe, *inputs)
         self.iteration += 1
-        if self.iteration % 100 == 0:
-            print(f"[svi] iter={self.iteration} loss={loss.item():.5f} bank={self.error_bank.occupancy()}")
+        if self.iteration % 20 == 0:
+            print(f"[svi] iter={self.iteration} loss={loss.item():.5f} bank={self.error_bank.occupancy()}", flush=True)
         return loss
 
 
