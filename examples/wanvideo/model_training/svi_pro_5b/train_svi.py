@@ -5,7 +5,7 @@
 # Copyright ModelScope Team, licensed under the Apache License 2.0.
 # SVI Error-Recycling Fine-Tuning training entry for Wan2.2-TI2V-5B by the
 # Stable-Video-Infinity-Reimplemented authors.
-import os, argparse, random, warnings
+import os, argparse, random, warnings, time
 import torch
 import imageio
 import accelerate
@@ -24,40 +24,103 @@ from tqdm import tqdm
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# Silence the per-tile "VAE encoding/decoding" tqdm bars inside the training
+# loop - the outer svi-train bar is the only progress display we want.
+import diffsynth.models.wan_video_vae as _wan_vae
+_wan_vae.tqdm = lambda iterable=None, *args, **kwargs: iterable
 
-def launch_svi_training_task(accelerator, dataset, model, model_logger, args):
+
+def launch_svi_training_task(accelerator, dataset, model, model_logger, args, val_loader=None):
     """Training loop with a global tqdm bar (loss + EMA + error-bank occupancy)
     and grad clipping 1.0 (paper Table 9). Forked from
-    diffsynth.diffusion.runner.launch_training_task."""
+    diffsynth.diffusion.runner.launch_training_task.
+
+    If val_loader is given, runs a deterministic clean-input validation every
+    args.val_every steps. All metrics are appended per step to
+    <output_path>/metrics.csv (loss, ema, grad_norm, lr, sec/step, bank
+    occupancy, peak GPU memory, and val_loss/best_val/is_best on val steps) —
+    one file, ready for plotting. Saves best-val.safetensors whenever val
+    improves; stops early if val doesn't improve for args.early_stop_patience
+    steps (0 disables), and prints the best checkpoint at the end of training."""
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=args.dataset_num_workers)
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
     raw_model = model.module if hasattr(model, "module") else model
 
+    os.makedirs(args.output_path, exist_ok=True)
+    metrics_path = os.path.join(args.output_path, "metrics.csv")
+    if not os.path.exists(metrics_path):
+        with open(metrics_path, "w") as f:
+            f.write("step,epoch,unix_time,loss,ema,grad_norm,lr,sec_per_step,"
+                    "bank_vid,bank_noi,gpu_max_mem_gb,val_loss,best_val,is_best\n")
+
     total_steps = len(dataloader) * args.num_epochs
-    ema = None
+    ema, last_val = None, None
+    best_val, bad_val_events, stop_early = None, 0, False
     with tqdm(total=total_steps, desc="svi-train", dynamic_ncols=True) as pbar:
         for epoch_id in range(args.num_epochs):
             for data in dataloader:
+                t0 = time.time()
                 with accelerator.accumulate(model):
                     optimizer.zero_grad()
                     loss = model(data)
                     accelerator.backward(loss)
-                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     model_logger.on_step_end(accelerator, model, args.save_steps)
                     scheduler.step()
                 v = loss.detach().float().item()
                 ema = v if ema is None else 0.98 * ema + 0.02 * v
+                step = raw_model.iteration
+                val_field, best_field, is_best_field = "", "", ""
+                if val_loader is not None and step % args.val_every == 0:
+                    last_val = raw_model.validate(val_loader, args.val_batches)
+                    is_best = best_val is None or last_val < best_val - args.early_stop_min_delta
+                    if is_best:
+                        best_val, bad_val_events = last_val, 0
+                        model_logger.save_model(accelerator, model, "best-val.safetensors")
+                        print(f"[svi] new best val {best_val:.5f} -> saved best-val.safetensors", flush=True)
+                    else:
+                        bad_val_events += 1
+                        if args.early_stop_patience > 0 and bad_val_events * args.val_every >= args.early_stop_patience:
+                            print(f"[svi] EARLY STOP at iter={step}: no val improvement for "
+                                  f"{bad_val_events * args.val_every} steps (best val {best_val:.5f})", flush=True)
+                            stop_early = True
+                    val_field, best_field, is_best_field = f"{last_val:.6f}", f"{best_val:.6f}", str(int(is_best))
+                    print(f"[svi] VALIDATION iter={step} val_loss={last_val:.5f} train_ema={ema:.5f}", flush=True)
                 occ = raw_model.error_bank.occupancy()
-                pbar.set_postfix(loss=f"{v:.4f}", ema=f"{ema:.4f}",
-                                 bank_vid=occ["vid"]["total"], bank_noi=occ["noi"]["total"],
-                                 epoch=epoch_id)
+                gpu_gb = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
+                with open(metrics_path, "a") as f:
+                    f.write(f"{step},{epoch_id},{int(time.time())},{v:.6f},{ema:.6f},{float(grad_norm):.4f},"
+                            f"{optimizer.param_groups[0]['lr']:.2e},{time.time() - t0:.2f},"
+                            f"{occ['vid']['total']},{occ['noi']['total']},{gpu_gb:.2f},"
+                            f"{val_field},{best_field},{is_best_field}\n")
+                postfix = {"loss": f"{v:.4f}", "ema": f"{ema:.4f}",
+                           "bank_vid": occ["vid"]["total"], "bank_noi": occ["noi"]["total"],
+                           "epoch": epoch_id}
+                if last_val is not None:
+                    postfix["val"] = f"{last_val:.4f}"
+                if best_val is not None:
+                    postfix["best_val"] = f"{best_val:.4f}"
+                pbar.set_postfix(postfix)
                 pbar.update(1)
+                if stop_early:
+                    break
+            if stop_early:
+                break
             if args.save_steps is None:
                 model_logger.on_epoch_end(accelerator, model, epoch_id)
     model_logger.on_training_end(accelerator, model, args.save_steps)
+    if accelerator.is_main_process:
+        if best_val is not None:
+            print(f"[svi] TRAINING DONE at iter={raw_model.iteration}. "
+                  f"Best checkpoint: {os.path.join(args.output_path, 'best-val.safetensors')} "
+                  f"(val_loss {best_val:.5f})", flush=True)
+        else:
+            print(f"[svi] TRAINING DONE at iter={raw_model.iteration}. "
+                  f"Validation was disabled - no best checkpoint; use the step-*.safetensors "
+                  f"checkpoints in {args.output_path}", flush=True)
 
 
 class LoadSVIVideoPair(DataProcessingOperator):
@@ -161,6 +224,12 @@ class WanSVITrainingModule(DiffusionTrainingModule):
             max_errors_per_grid=svi_max_errors_per_grid,
             spatial_pool=svi_spatial_pool,
         )
+        # Validation state (lazy): dummy bank (capacity 1) so val forwards never
+        # pollute the training replay memory, and a clean-input config.
+        self._bank_anchor_timesteps = anchor_sched.timesteps
+        self._bank_spatial_pool = svi_spatial_pool
+        self._val_bank = None
+        self._val_config = None
         self.svi_config = svi_config if svi_config is not None else SVIConfig()
         self.iteration = 0
         self.num_motion_latent = num_motion_latent
@@ -212,6 +281,56 @@ class WanSVITrainingModule(DiffusionTrainingModule):
             print(f"[svi] iter={self.iteration} loss={loss.item():.5f} bank={self.error_bank.occupancy()}", flush=True)
         return loss
 
+    @torch.no_grad()
+    def validate(self, val_dataloader, num_batches=8, seed=1234):
+        """Deterministic clean-input validation on the held-out split.
+
+        Same fixed batches, window/anchor draws, timesteps and noise on every
+        call (seeded per batch index), so the val-loss curve is comparable
+        across steps. Uses p_clean=1.0 (no error injection) — it measures
+        whether the LoRA preserves base-generation quality on unseen videos.
+        Errors curated during val go to a throwaway bank (capacity 1), never
+        into the training replay memory. Global RNG states are restored
+        afterwards so the training stream is unaffected.
+        """
+        if self._val_bank is None:
+            self._val_bank = ErrorReplayBank(
+                self._bank_anchor_timesteps, max_errors_per_grid=1,
+                spatial_pool=self._bank_spatial_pool,
+            )
+            self._val_config = SVIConfig(
+                p_clean=1.0,
+                mode_probs=self.svi_config.mode_probs,
+                warmup_iter=self.svi_config.warmup_iter,
+                loss_mask_cond_frames=self.svi_config.loss_mask_cond_frames,
+            )
+        py_state = random.getstate()
+        cpu_state = torch.get_rng_state()
+        cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        losses = []
+        try:
+            for i, data in enumerate(val_dataloader):
+                if i >= num_batches:
+                    break
+                random.seed(seed + i)
+                torch.manual_seed(seed + i)
+                inputs = self.get_pipeline_inputs(data)
+                inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
+                for unit in self.pipe.units:
+                    inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
+                inputs_shared, inputs_posi, _ = inputs
+                loss = SVIErrorRecyclingLoss(
+                    self.pipe, self._val_bank, self._val_config, self.iteration,
+                    rng_seed=seed + i, **inputs_shared, **inputs_posi,
+                )
+                losses.append(loss.detach().float().item())
+        finally:
+            random.setstate(py_state)
+            torch.set_rng_state(cpu_state)
+            if cuda_state is not None:
+                torch.cuda.set_rng_state_all(cuda_state)
+        return sum(losses) / max(1, len(losses))
+
 
 def svi_parser():
     parser = argparse.ArgumentParser(description="SVI-Pro ERFT training for Wan2.2-TI2V-5B.")
@@ -235,6 +354,14 @@ def svi_parser():
     parser.add_argument("--svi_loss_mask_cond_frames", type=int, default=1, choices=[0, 1])
     parser.add_argument("--resume_auto", action="store_true",
                         help="Auto-resume from the newest checkpoint in --output_path (weights only).")
+    # Validation (held-out split)
+    parser.add_argument("--val_split", type=float, default=0.1, help="Fraction of videos held out for validation (seeded split).")
+    parser.add_argument("--val_every", type=int, default=200, help="Validate every N training steps (0 disables).")
+    parser.add_argument("--val_batches", type=int, default=8, help="Fixed batches per validation event.")
+    parser.add_argument("--early_stop_patience", type=int, default=2000,
+                        help="Stop training if val loss hasn't improved for this many steps (0 disables; needs validation on).")
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.0,
+                        help="Minimum val-loss improvement that counts as progress (resets patience).")
     return parser
 
 
@@ -277,6 +404,21 @@ if __name__ == "__main__":
             )
         ),
     )
+    # Deterministic 90/10 train/holdout split (fixed seed -> identical split on
+    # every run, so resumed training never trains on the val set).
+    val_loader = None
+    if args.val_every > 0 and args.val_split > 0:
+        import copy
+        order = list(range(len(dataset.data)))
+        random.Random(42).shuffle(order)
+        n_val = max(1, int(len(order) * args.val_split))
+        val_dataset = copy.copy(dataset)
+        val_dataset.data = [dataset.data[i] for i in order[:n_val]]
+        dataset.data = [dataset.data[i] for i in order[n_val:]]
+        # workers=0: window/anchor draws run in-process under our seeds.
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset, shuffle=False, collate_fn=lambda x: x[0], num_workers=0)
+        print(f"[svi] holdout split: {len(order) - n_val} train / {n_val} val videos", flush=True)
     mode_probs = [float(x) for x in args.svi_mode_probs.split(",")]
     svi_config = SVIConfig(
         p_vid=args.svi_p_vid,
@@ -313,4 +455,4 @@ if __name__ == "__main__":
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
     )
-    launch_svi_training_task(accelerator, dataset, model, model_logger, args)
+    launch_svi_training_task(accelerator, dataset, model, model_logger, args, val_loader=val_loader)

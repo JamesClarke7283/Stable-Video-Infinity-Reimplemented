@@ -47,19 +47,17 @@ def fetch_probe_normalize(job):
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False, dir="/tmp")
     tmp.close()
     try:
-        got = False
-        for res in ("720", "360"):
-            url = f"https://assets.mixkit.co/videos/{vid}/{vid}-{res}.mp4"
-            r = subprocess.run(["curl", "-sL", "--fail", "-o", tmp.name, url], capture_output=True)
-            if r.returncode == 0 and os.path.getsize(tmp.name) > 100000:
-                got = True
-                break
-        if not got:
+        url = f"https://assets.mixkit.co/videos/{vid}/{vid}-720.mp4"
+        r = subprocess.run(["curl", "-sL", "--fail", "-o", tmp.name, url], capture_output=True)
+        if r.returncode != 0 or os.path.getsize(tmp.name) <= 100000:
             return None
         info = probe(tmp.name)
         if info is None:
             return None
         w, h, fps, frames, dur = info
+        # 720p landscape originals only - no 360p fallback, no portrait.
+        if (w, h) != (1280, 720):
+            return (base, w, h, fps, dur, 0)
         if dur < min_dur:
             return (base, w, h, fps, dur, 0)
         out_path = os.path.join(out_dir, "videos", base)

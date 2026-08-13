@@ -166,15 +166,19 @@ def _svi_sample_mode(mode_probs, has_anchor, has_motion, rng: random.Random):
     return mode
 
 
-def SVIErrorRecyclingLoss(pipe: BasePipeline, error_bank, svi_config: SVIConfig, iteration: int, **inputs):
+def SVIErrorRecyclingLoss(pipe: BasePipeline, error_bank, svi_config: SVIConfig, iteration: int, rng_seed: int = None, **inputs):
     """SVI Error-Recycling Fine-Tuning loss (paper Eq. 3-6).
 
     Corrupts the clean flow-matching input with the DiT's own banked errors,
     trains the model to predict the error-recycled velocity V_rcy pointing to the
     *clean* latent, and banks freshly computed errors back into the replay memory.
+
+    `rng_seed` (default None = OS entropy, training behavior) makes the
+    mode/injection draws reproducible — used by validation for comparable
+    val-loss curves.
     """
     scheduler = pipe.scheduler  # training mode, 1000 shifted timesteps
-    rng = random.Random()
+    rng = random.Random(rng_seed)
     device = pipe.device
 
     input_latents = inputs["input_latents"]            # (1, 48, T, h, w), clean x0

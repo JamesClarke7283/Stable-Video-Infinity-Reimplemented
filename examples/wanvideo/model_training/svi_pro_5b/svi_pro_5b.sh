@@ -6,6 +6,7 @@ set -e
 cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
 
 export DIFFSYNTH_DOWNLOAD_SOURCE=huggingface
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 .venv/bin/accelerate launch --num_processes 1 examples/wanvideo/model_training/svi_pro_5b/train_svi.py \
   --dataset_base_path data/svi_mixkit \
@@ -22,9 +23,11 @@ export DIFFSYNTH_DOWNLOAD_SOURCE=huggingface
   --lora_target_modules "q,k,v,o,ffn.0,ffn.2" \
   --lora_rank 128 \
   --use_gradient_checkpointing \
+  --fp8_models "Wan-AI/Wan2.2-TI2V-5B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.2-TI2V-5B:Wan2.2_VAE.pth" \
+  --vae_tiled \
   --output_path models/train/svi_pro_5b_lora \
   --remove_prefix_in_ckpt "pipe.dit." \
-  --save_steps 1000 \
+  --save_steps 100 \
   --dataset_num_workers 2 \
   --num_motion_latent 1 \
   --svi_p_vid 0.9 \
@@ -36,4 +39,8 @@ export DIFFSYNTH_DOWNLOAD_SOURCE=huggingface
   --svi_spatial_pool 2 \
   --svi_mode_probs "0.45,0.15,0.30,0.10" \
   --svi_loss_mask_cond_frames 1 \
+  --val_split 0.1 \
+  --val_every 200 \
+  --val_batches 8 \
+  --early_stop_patience 2000 \
   --resume_auto

@@ -364,3 +364,20 @@ state-dict hash — use the untouched official 5B files; H/W must be divisible b
   `--svi_max_errors_per_grid`.
 - **8.1 merged into 8.3b**: stock-framework LoRA sanity is covered by the SVI smoke
   run (same accelerate/runner/ModelLogger path), so no separate stock run.
+- **Hardware correction + OOM fix (2026-08-13)**: this machine is an **RTX 5090 32GB**,
+  not the 98GB RTX PRO 6000 assumed in Sec. 6 — 720P×121f single-stage training OOM'd
+  with all-bf16 models. Fix in `svi_pro_5b.sh`: fp8 storage for T5+VAE
+  (`--fp8_models`, compute stays bf16), `--vae_tiled`, and
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. Verified: sustained training
+  cycles at 100% GPU, peak ~30.0GB. Dataset rebuilt properly at true 720p:
+  1500 MixKit CDN originals, all 1280×720@24fps (360p fallback removed from
+  `prepare_dataset_v2.py`), 95% chained-capable, 279 LLaVA + 1221 cleaned-slug
+  captions. If OOM recurs: add `--use_gradient_checkpointing_offload`, then fall
+  back to 960×544 (Risk 7).
+- **Holdout validation (2026-08-13)**: `train_svi.py` now does a deterministic
+  seeded 90/10 train/val split (fixed across resumes) and, every `--val_every 200`
+  steps, evaluates `--val_batches 8` fixed held-out batches with clean inputs
+  (p_clean=1.0, seeded RNG incl. new `rng_seed` arg on `SVIErrorRecyclingLoss`,
+  errors banked to a throwaway capacity-1 bank) — appended to
+  `<output_path>/val_log.csv` and shown in the tqdm postfix. Smoke-tested:
+  events fired, CSV rows written, no GPU-memory change.
