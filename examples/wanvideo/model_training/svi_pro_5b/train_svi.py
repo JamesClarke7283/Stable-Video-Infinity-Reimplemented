@@ -58,6 +58,7 @@ def launch_svi_training_task(accelerator, dataset, model, model_logger, args, va
     total_steps = len(dataloader) * args.num_epochs
     ema, last_val = None, None
     best_val, bad_val_events, stop_early = None, 0, False
+    postfix = {}
     with tqdm(total=total_steps, desc="svi-train", dynamic_ncols=True) as pbar:
         for epoch_id in range(args.num_epochs):
             for data in dataloader:
@@ -75,7 +76,10 @@ def launch_svi_training_task(accelerator, dataset, model, model_logger, args, va
                 step = raw_model.iteration
                 val_field, best_field, is_best_field = "", "", ""
                 if val_loader is not None and step % args.val_every == 0:
-                    last_val = raw_model.validate(val_loader, args.val_batches)
+                    def _val_hook(i, n, m, _base=dict(postfix)):
+                        _base["val_run"] = f"{i}/{n} {m:.4f}"
+                        pbar.set_postfix(_base)
+                    last_val = raw_model.validate(val_loader, args.val_batches, progress_hook=_val_hook)
                     is_best = best_val is None or last_val < best_val - args.early_stop_min_delta
                     if is_best:
                         best_val, bad_val_events = last_val, 0
@@ -282,7 +286,7 @@ class WanSVITrainingModule(DiffusionTrainingModule):
         return loss
 
     @torch.no_grad()
-    def validate(self, val_dataloader, num_batches=8, seed=1234):
+    def validate(self, val_dataloader, num_batches=8, seed=1234, progress_hook=None):
         """Deterministic clean-input validation on the held-out split.
 
         Same fixed batches, window/anchor draws, timesteps and noise on every
@@ -291,7 +295,8 @@ class WanSVITrainingModule(DiffusionTrainingModule):
         whether the LoRA preserves base-generation quality on unseen videos.
         Errors curated during val go to a throwaway bank (capacity 1), never
         into the training replay memory. Global RNG states are restored
-        afterwards so the training stream is unaffected.
+        afterwards so the training stream is unaffected. progress_hook(i, n,
+        running_mean) is called after each batch (live progress display).
         """
         if self._val_bank is None:
             self._val_bank = ErrorReplayBank(
@@ -307,6 +312,7 @@ class WanSVITrainingModule(DiffusionTrainingModule):
         py_state = random.getstate()
         cpu_state = torch.get_rng_state()
         cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        total = min(num_batches, len(val_dataloader))
         losses = []
         try:
             for i, data in enumerate(val_dataloader):
@@ -324,6 +330,8 @@ class WanSVITrainingModule(DiffusionTrainingModule):
                     rng_seed=seed + i, **inputs_shared, **inputs_posi,
                 )
                 losses.append(loss.detach().float().item())
+                if progress_hook is not None:
+                    progress_hook(i + 1, total, sum(losses) / len(losses))
         finally:
             random.setstate(py_state)
             torch.set_rng_state(cpu_state)
