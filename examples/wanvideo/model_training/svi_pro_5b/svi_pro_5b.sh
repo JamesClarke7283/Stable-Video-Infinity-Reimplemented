@@ -41,6 +41,6 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   --svi_loss_mask_cond_frames 1 \
   --val_split 0.1 \
   --val_every 200 \
-  --val_batches 8 \
+  --val_batches 16 \
   --early_stop_patience 2000 \
   --resume_auto
