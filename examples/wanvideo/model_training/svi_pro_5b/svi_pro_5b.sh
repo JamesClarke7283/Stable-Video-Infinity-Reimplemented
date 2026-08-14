@@ -15,7 +15,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   --width 1280 \
   --num_frames 121 \
   --dataset_repeat 1 \
-  --num_epochs 10 \
+  --num_epochs 2 \
   --model_id_with_origin_paths "Wan-AI/Wan2.2-TI2V-5B:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.2-TI2V-5B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.2-TI2V-5B:Wan2.2_VAE.pth" \
   --learning_rate 1e-4 \
   --weight_decay 0.01 \
