@@ -44,6 +44,14 @@ def probe(path):
 def fetch_probe_normalize(job):
     vid, slug, out_dir, min_dur = job
     base = f"{slug}-{vid}.mp4"
+    out_path = os.path.join(out_dir, "videos", base)
+    if os.path.exists(out_path):
+        # Already downloaded+normalized in a previous run - keep, just re-probe.
+        info = probe(out_path)
+        if info is None:
+            return None
+        w, h, fps, frames, dur = info
+        return (base, w, h, fps, dur, 1 if dur >= min_dur else 0)
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False, dir="/tmp")
     tmp.close()
     try:

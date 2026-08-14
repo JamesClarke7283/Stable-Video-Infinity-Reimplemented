@@ -36,8 +36,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   --svi_p_noi 0.01 \
   --svi_p_clean 0.5 \
   --svi_warmup_iter 50 \
-  --svi_max_errors_per_grid 200 \
-  --svi_spatial_pool 2 \
+  --svi_max_errors_per_grid 500 \
+  --svi_spatial_pool 3 \
   --svi_mode_probs "0.45,0.15,0.30,0.10" \
   --svi_loss_mask_cond_frames 1 \
   --val_split 0.1 \
