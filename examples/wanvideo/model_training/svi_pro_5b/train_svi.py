@@ -5,7 +5,7 @@
 # Copyright ModelScope Team, licensed under the Apache License 2.0.
 # SVI Error-Recycling Fine-Tuning training entry for Wan2.2-TI2V-5B by the
 # Stable-Video-Infinity-Reimplemented authors.
-import os, argparse, random, warnings, time
+import os, argparse, random, warnings, time, re
 import torch
 import imageio
 import accelerate
@@ -30,6 +30,34 @@ import diffsynth.models.wan_video_vae as _wan_vae
 _wan_vae.tqdm = lambda iterable=None, *args, **kwargs: iterable
 
 
+def save_training_state(state_path, model_logger, optimizer, scheduler, raw_model,
+                        epoch_id, ema, last_val, best_val, bad_val_events):
+    """Full training-state snapshot for exact resume: optimizer/scheduler state,
+    step/epoch counters, EMA + early-stopping state, error replay banks, and RNG
+    states. Written atomically (tmp + rename) next to the step-*.safetensors LoRA
+    checkpoint saved at the same step."""
+    state = {
+        "iteration": raw_model.iteration,
+        "epoch_id": epoch_id,
+        "num_steps": model_logger.num_steps,
+        "ema": ema,
+        "last_val": last_val,
+        "best_val": best_val,
+        "bad_val_events": bad_val_events,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "error_banks": raw_model.error_bank.banks,
+        "rng": {
+            "python": random.getstate(),
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+    }
+    tmp_path = state_path + ".tmp"
+    torch.save(state, tmp_path)
+    os.replace(tmp_path, state_path)
+
+
 def launch_svi_training_task(accelerator, dataset, model, model_logger, args, val_loader=None):
     """Training loop with a global tqdm bar (loss + EMA + error-bank occupancy)
     and grad clipping 1.0 (paper Table 9). Forked from
@@ -41,7 +69,13 @@ def launch_svi_training_task(accelerator, dataset, model, model_logger, args, va
     occupancy, peak GPU memory, and val_loss/best_val/is_best on val steps) —
     one file, ready for plotting. Saves best-val.safetensors whenever val
     improves; stops early if val doesn't improve for args.early_stop_patience
-    steps (0 disables), and prints the best checkpoint at the end of training."""
+    steps (0 disables), and prints the best checkpoint at the end of training.
+
+    Every args.save_steps, alongside the step-N LoRA safetensors, a full
+    training-state snapshot (optimizer, scheduler, counters, EMA, early-stopping
+    state, error banks, RNG) is written to training_state.pt. --resume_auto
+    performs an exact full-state resume when the snapshot matches the newest
+    checkpoint, otherwise falls back to weights-only resume."""
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=args.dataset_num_workers)
@@ -55,13 +89,49 @@ def launch_svi_training_task(accelerator, dataset, model, model_logger, args, va
             f.write("step,epoch,unix_time,loss,ema,grad_norm,lr,sec_per_step,"
                     "bank_vid,bank_noi,gpu_max_mem_gb,val_loss,best_val,is_best\n")
 
-    total_steps = len(dataloader) * args.num_epochs
+    # ---- Resume: full-state if the snapshot matches the checkpoint, else
+    # weights-only (LoRA weights were already loaded via args.lora_checkpoint).
+    state_path = os.path.join(args.output_path, "training_state.pt")
+    start_step, start_epoch, skip_batches = 0, 0, 0
     ema, last_val = None, None
     best_val, bad_val_events, stop_early = None, 0, False
+    if args.resume_auto and os.path.exists(state_path):
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        ckpt_step = None
+        if args.lora_checkpoint is not None:
+            m = re.match(r"step-(\d+)\.safetensors$", os.path.basename(args.lora_checkpoint))
+            ckpt_step = int(m.group(1)) if m else None
+        if ckpt_step is not None and state["iteration"] == ckpt_step:
+            optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
+            raw_model.iteration = state["iteration"]
+            raw_model.error_bank.banks = state["error_banks"]
+            model_logger.num_steps = state["num_steps"]
+            ema, last_val = state["ema"], state["last_val"]
+            best_val, bad_val_events = state["best_val"], state["bad_val_events"]
+            rng = state["rng"]
+            random.setstate(rng["python"])
+            torch.set_rng_state(rng["torch_cpu"])
+            if rng["torch_cuda"] is not None:
+                torch.cuda.set_rng_state_all(rng["torch_cuda"])
+            steps_per_epoch = len(dataloader)
+            start_step = raw_model.iteration
+            start_epoch, skip_batches = divmod(start_step, steps_per_epoch)
+            occ = raw_model.error_bank.occupancy()
+            print(f"[svi] FULL-STATE RESUME at step {start_step} "
+                  f"(epoch {start_epoch}, skipping {skip_batches} batches): optimizer/scheduler/RNG "
+                  f"restored, banks reloaded (vid {occ['vid']['total']} + noi {occ['noi']['total']})", flush=True)
+        else:
+            print(f"[svi] training_state.pt (iteration={state['iteration']}) does not match the resume "
+                  f"checkpoint (step={ckpt_step}) - falling back to weights-only resume.", flush=True)
     postfix = {}
-    with tqdm(total=total_steps, desc="svi-train", dynamic_ncols=True) as pbar:
-        for epoch_id in range(args.num_epochs):
-            for data in dataloader:
+    total_steps = len(dataloader) * args.num_epochs
+    with tqdm(total=total_steps, initial=start_step, desc="svi-train", dynamic_ncols=True) as pbar:
+        for epoch_id in range(start_epoch, args.num_epochs):
+            active_loader = dataloader
+            if epoch_id == start_epoch and skip_batches > 0:
+                active_loader = accelerator.skip_first_batches(dataloader, skip_batches)
+            for data in active_loader:
                 t0 = time.time()
                 with accelerator.accumulate(model):
                     optimizer.zero_grad()
@@ -70,6 +140,9 @@ def launch_svi_training_task(accelerator, dataset, model, model_logger, args, va
                     grad_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     model_logger.on_step_end(accelerator, model, args.save_steps)
+                    if args.save_steps is not None and model_logger.num_steps % args.save_steps == 0:
+                        save_training_state(state_path, model_logger, optimizer, scheduler, raw_model,
+                                            epoch_id, ema, last_val, best_val, bad_val_events)
                     scheduler.step()
                 v = loss.detach().float().item()
                 ema = v if ema is None else 0.98 * ema + 0.02 * v

@@ -388,3 +388,12 @@ state-dict hash — use the untouched official 5B files; H/W must be divisible b
   ~25GB, ~6GB headroom. Auto-resumed from step-1000; metrics logging, early
   stopping, live val progress, and 720p dataset build all landed earlier this
   week (commits 8d91aca..a50e444).
+- **Full-state checkpointing (2026-08-14)**: `train_svi.py` now writes
+  `training_state.pt` alongside every step-N LoRA checkpoint (`--save_steps 100`):
+  optimizer + scheduler state, global step/epoch counters, EMA, early-stopping
+  state, error replay banks, and RNG states. `--resume_auto` does an exact
+  full-state resume (bar continues at step N, batches skipped to epoch position)
+  when the snapshot matches the newest checkpoint, else falls back to
+  weights-only. Smoke-verified: save at step 3, kill, resume → "FULL-STATE
+  RESUME at step 3 (epoch 0, skipping 3 batches)", banks reloaded. Previous
+  checkpoints deleted; fresh 10-epoch run started with this build.
