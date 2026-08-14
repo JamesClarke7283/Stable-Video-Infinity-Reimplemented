@@ -381,3 +381,10 @@ state-dict hash — use the untouched official 5B files; H/W must be divisible b
   errors banked to a throwaway capacity-1 bank) — appended to
   `<output_path>/val_log.csv` and shown in the tqdm postfix. Smoke-tested:
   events fired, CSV rows written, no GPU-memory change.
+- **Checkpoint-offload OOM fix (2026-08-14)**: run OOM'd at step 1035 (8h in) —
+  baseline peak was ~29.8GB and an external process (rustdesk, 537MB) ate the
+  remaining headroom during a backward spike. Added
+  `--use_gradient_checkpointing_offload` to `svi_pro_5b.sh`: steady-state now
+  ~25GB, ~6GB headroom. Auto-resumed from step-1000; metrics logging, early
+  stopping, live val progress, and 720p dataset build all landed earlier this
+  week (commits 8d91aca..a50e444).

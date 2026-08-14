@@ -23,6 +23,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   --lora_target_modules "q,k,v,o,ffn.0,ffn.2" \
   --lora_rank 128 \
   --use_gradient_checkpointing \
+  --use_gradient_checkpointing_offload \
   --fp8_models "Wan-AI/Wan2.2-TI2V-5B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.2-TI2V-5B:Wan2.2_VAE.pth" \
   --vae_tiled \
   --output_path models/train/svi_pro_5b_lora \
